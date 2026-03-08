@@ -1,0 +1,7 @@
+Message from Anvis Representative concern downloading records from the VF30 Pro
+
+Hi Julian,
+
+Sorry for the late reply, we just come back from holidays yesterday. Our engineer replied that please call CChex_SetSdkConfig(handle, AutoDownload=1, RecordFlag=1, LogFile=1), then our SDK will then generate a log file, please send us the log file so our engineer can check it.
+
+Please also send me the firmware version of VF30 Pro.

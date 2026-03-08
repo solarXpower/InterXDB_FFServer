@@ -1,0 +1,15 @@
+V300 Finger Print Reader
+IP  192.168.1.218
+
+Port#  5010
+
+Admin 0  ( Zero)
+Password 12345
+
+
+Enroll User MW
+ 
+User:       900
+Password:  90
+
+

@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts (large — not needed in repo)
+build/
+dist/
+*.spec.bak
+
+# Runtime files (generated on first run)
+interxdb.db
+interxdb_config.json
+person_debug.hex
+*.log
+
+# Debug logs
+*debuginfo.log
+
+# Large SDK source (binary DLLs — keep only the spec and source)
+TC_B_SDK_V64_20250611/SDK FILES/*.dll
+TC_B_SDK_V64_20250611/SDK FILES/*.lib
+
+# Installer output
+installer/
+
+# PDFs and other large docs (optional — remove lines below to include them)
+*.pdf
