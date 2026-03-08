@@ -17,9 +17,16 @@ person_debug.hex
 # Debug logs
 *debuginfo.log
 
-# Large SDK source (binary DLLs — keep only the spec and source)
-TC_B_SDK_V64_20250611/SDK FILES/*.dll
-TC_B_SDK_V64_20250611/SDK FILES/*.lib
+# Large SDK source (binary DLLs — keep only headers and source code)
+TC_B_SDK_V64_20250611/**/*.dll
+TC_B_SDK_V64_20250611/**/*.lib
+TC_B_SDK_V64_20250611/**/*.exe
+TC_B_SDK_V64_20250611/**/*.pdb
+TC_B_SDK_V64_20250611/**/*.suo
+TC_B_SDK_V64_20250611/**/*.cache
+TC_B_SDK_V64_20250611/**/obj/
+TC_B_SDK_V64_20250611/**/.vs/
+TC_B_SDK_V64_20250611/**/.DS_Store
 
 # Installer output
 installer/
