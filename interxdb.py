@@ -46,17 +46,18 @@ import sqlite3
 APP_NAME    = "InterXDB_FFServer"
 APP_VERSION = "1.0"
 
-# When frozen by PyInstaller, __file__ lives inside _internal which is read-only.
-# Use the EXE's own directory for writable files (config, DB, logs).
+# When frozen by PyInstaller the EXE may be in Program Files (read-only).
+# Writable files (DB, config, logs) go to %APPDATA%\InterXDB_FFServer\.
+# Read-only assets (DLL, images) come from _BUNDLE_DIR (_internal folder).
 if getattr(sys, "frozen", False):
-    # Running as compiled EXE
-    _EXE_DIR    = os.path.dirname(sys.executable)          # dist\InterXDB_FFServer\
-    _BUNDLE_DIR = sys._MEIPASS                              # dist\InterXDB_FFServer\_internal\
-    APP_DIR     = _EXE_DIR
+    _BUNDLE_DIR = sys._MEIPASS                              # _internal\ (read-only assets)
 else:
-    _EXE_DIR    = os.path.dirname(os.path.abspath(__file__))
-    _BUNDLE_DIR = _EXE_DIR
-    APP_DIR     = _EXE_DIR
+    _BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# User-writable data directory — works for both dev and installed EXE
+_APPDATA    = os.environ.get("APPDATA", os.path.expanduser("~"))
+APP_DIR     = os.path.join(_APPDATA, "InterXDB_FFServer")
+os.makedirs(APP_DIR, exist_ok=True)                         # create on first run
 
 LOGO_PATH   = os.path.join(_BUNDLE_DIR, "InterXDB LOGO.jpg")  # GUI sidebar logo
 ICON_PATH   = os.path.join(_BUNDLE_DIR, "InterXICO.ico")      # window/taskbar icon
