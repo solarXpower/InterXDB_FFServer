@@ -348,6 +348,25 @@ class Database:
             c.execute("CREATE INDEX IF NOT EXISTS ix_ts  ON punches(timestamp)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_uid ON punches(user_id)")
 
+            # ac_users — person directory owned by InterXDB_FFServer.
+            # SmartBuild reads this table in read-only mode for Access Control.
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS ac_users (
+                    user_id    INTEGER PRIMARY KEY,
+                    first_name TEXT    NOT NULL DEFAULT '',
+                    last_name  TEXT    NOT NULL DEFAULT '',
+                    org_name   TEXT    NOT NULL DEFAULT '',
+                    department TEXT    NOT NULL DEFAULT '',
+                    photo_path TEXT    NOT NULL DEFAULT ''
+                )""")
+            # Migration: add photo_path to existing DBs that predate this column
+            try:
+                c.execute(
+                    "ALTER TABLE ac_users ADD COLUMN photo_path TEXT NOT NULL DEFAULT ''"
+                )
+            except Exception:
+                pass  # Column already exists — safe to ignore
+
     def insert(self, uid, code, label, verify, ts: datetime, dev_id, src):
         with sqlite3.connect(self.path) as c:
             c.execute(
@@ -378,6 +397,33 @@ class Database:
         with sqlite3.connect(self.path) as c:
             r = c.execute("SELECT COUNT(*) FROM punches").fetchone()
             return r[0] if r else 0
+
+    # ── ac_users CRUD ─────────────────────────────────────────────────────────
+
+    def ac_get_all(self):
+        """Return all rows from ac_users ordered by user_id."""
+        with sqlite3.connect(self.path) as c:
+            c.row_factory = sqlite3.Row
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM ac_users ORDER BY user_id"
+            ).fetchall()]
+
+    def ac_upsert(self, user_id: int, first_name: str, last_name: str,
+                  org_name: str, department: str, photo_path: str = ""):
+        """Insert or replace a person record in ac_users."""
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT OR REPLACE INTO ac_users "
+                "(user_id, first_name, last_name, org_name, department, photo_path) "
+                "VALUES (?,?,?,?,?,?)",
+                (user_id, first_name.strip(), last_name.strip(),
+                 org_name.strip(), department.strip(), photo_path.strip())
+            )
+
+    def ac_delete(self, user_id: int):
+        """Remove a person record from ac_users."""
+        with sqlite3.connect(self.path) as c:
+            c.execute("DELETE FROM ac_users WHERE user_id=?", (user_id,))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AnvizSDK wrapper
@@ -1312,6 +1358,675 @@ class SettingsPanel(QWidget):
             "Settings saved.\nRestart InterXDB_FFServer to apply connection changes.")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Add / Edit User Dialog
+# ─────────────────────────────────────────────────────────────────────────────
+class AddEditUserDialog(QDialog):
+    """Dialog for adding a new or editing an existing ac_users record."""
+
+    def __init__(self, parent=None, row: dict = None):
+        super().__init__(parent)
+        self._editing = row is not None
+        self.setWindowTitle("Edit Person" if self._editing else "Add Person")
+        self.setMinimumWidth(380)
+        self._build(row or {})
+
+    def _build(self, row: dict):
+        vl = QVBoxLayout(self)
+        vl.setSpacing(10)
+
+        # ── Main row: form left, photo right ──────────────────────────
+        main_row = QHBoxLayout()
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # User ID — read-only when editing (it's the primary key)
+        self._uid = QSpinBox()
+        self._uid.setRange(1, 9999999)
+        self._uid.setValue(int(row.get("user_id", 1)))
+        self._uid.setEnabled(not self._editing)   # lock PK on edit
+        form.addRow("User ID:", self._uid)
+
+        self._fname = QLineEdit(row.get("first_name", ""))
+        self._fname.setPlaceholderText("First name")
+        form.addRow("First Name:", self._fname)
+
+        self._lname = QLineEdit(row.get("last_name", ""))
+        self._lname.setPlaceholderText("Last name")
+        form.addRow("Last Name:", self._lname)
+
+        self._org = QLineEdit(row.get("org_name", ""))
+        self._org.setPlaceholderText("Company / organisation")
+        form.addRow("Organisation:", self._org)
+
+        self._dept = QLineEdit(row.get("department", ""))
+        self._dept.setPlaceholderText("Department")
+        form.addRow("Department:", self._dept)
+
+        # Photo path row
+        photo_row = QHBoxLayout()
+        self._photo_path = QLineEdit(row.get("photo_path", ""))
+        self._photo_path.setPlaceholderText("No photo selected")
+        self._photo_path.setReadOnly(True)
+        photo_row.addWidget(self._photo_path)
+        browse_b = QPushButton("Browse...")
+        browse_b.setMaximumWidth(80)
+        browse_b.clicked.connect(self._browse_photo)
+        photo_row.addWidget(browse_b)
+        clr_b = QPushButton("Clear")
+        clr_b.setMaximumWidth(55)
+        clr_b.clicked.connect(self._clear_photo)
+        photo_row.addWidget(clr_b)
+        form.addRow("Photo:", photo_row)
+
+        main_row.addLayout(form, stretch=2)
+
+        # Photo preview panel (right side)
+        self._preview = QLabel()
+        self._preview.setFixedSize(110, 130)
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setStyleSheet(
+            "background:#2a2a4a; border:1px solid #3a3a5a; border-radius:4px; color:#506070;"
+        )
+        self._preview.setText("No\nPhoto")
+        self._preview.setWordWrap(True)
+        main_row.addWidget(self._preview, stretch=0,
+                           alignment=Qt.AlignmentFlag.AlignTop)
+
+        vl.addLayout(main_row)
+
+        # Load existing photo preview if editing
+        if row.get("photo_path"):
+            self._update_preview(row["photo_path"])
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        vl.addWidget(btns)
+
+    def _browse_photo(self):
+        """Open file dialog to select a photo, then copy it to ac_photos folder."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Photo", "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.gif)"
+        )
+        if not path:
+            return
+        # Copy photo into APP_DIR/ac_photos/ so it stays alongside the DB
+        import shutil
+        photos_dir = os.path.join(APP_DIR, "ac_photos")
+        os.makedirs(photos_dir, exist_ok=True)
+        dest = os.path.join(photos_dir, os.path.basename(path))
+        try:
+            shutil.copy2(path, dest)
+        except Exception:
+            dest = path   # Fall back to original path if copy fails
+        self._photo_path.setText(dest)
+        self._update_preview(dest)
+
+    def _clear_photo(self):
+        """Remove the selected photo."""
+        self._photo_path.setText("")
+        self._preview.setPixmap(QPixmap())
+        self._preview.setText("No\nPhoto")
+
+    def _update_preview(self, path: str):
+        """Show a scaled thumbnail in the preview label."""
+        if path and os.path.isfile(path):
+            pix = QPixmap(path).scaled(
+                108, 128,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self._preview.setPixmap(pix)
+            self._preview.setText("")
+        else:
+            self._preview.setPixmap(QPixmap())
+            self._preview.setText("No\nPhoto")
+
+    def _accept(self):
+        """Validate before accepting."""
+        if not self._fname.text().strip() and not self._lname.text().strip():
+            QMessageBox.warning(self, "Missing Name",
+                                "Please enter at least a first or last name.")
+            return
+        self.accept()
+
+    def get_values(self) -> dict:
+        """Return the entered values as a dict."""
+        return {
+            "user_id":    self._uid.value(),
+            "first_name": self._fname.text().strip(),
+            "last_name":  self._lname.text().strip(),
+            "org_name":   self._org.text().strip(),
+            "department": self._dept.text().strip(),
+            "photo_path": self._photo_path.text().strip(),
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manage Users Panel  (ac_users table — person directory for SmartBuild)
+# ─────────────────────────────────────────────────────────────────────────────
+class ManageUsersPanel(QWidget):
+    """
+    CRUD panel for the ac_users table.
+    This is the person directory that SmartBuild reads (read-only) for
+    Access Control — matching punch user_ids to real names/departments.
+    """
+
+    def __init__(self, db: Database):
+        super().__init__()
+        self.db = db
+        self._build()
+        self._load()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+
+        hdr = QLabel("Manage Users  (Access Control Directory)")
+        hdr.setObjectName("title")
+        root.addWidget(hdr)
+
+        note = QLabel(
+            "This directory links User IDs (from the fingerprint reader) to person details.\n"
+            "SmartBuild reads this data in read-only mode for its Access Control panel."
+        )
+        note.setObjectName("subtitle")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        # Toolbar
+        tb = QHBoxLayout()
+        add_b = QPushButton("Add Person"); add_b.setObjectName("accent")
+        add_b.clicked.connect(self._add)
+        tb.addWidget(add_b)
+
+        edit_b = QPushButton("Edit Selected"); edit_b.clicked.connect(self._edit)
+        tb.addWidget(edit_b)
+
+        del_b = QPushButton("Delete Selected"); del_b.setObjectName("danger")
+        del_b.clicked.connect(self._delete)
+        tb.addWidget(del_b)
+
+        tb.addStretch()
+
+        ref_b = QPushButton("Refresh"); ref_b.clicked.connect(self._load)
+        tb.addWidget(ref_b)
+
+        self._cnt = QLabel("0 persons")
+        self._cnt.setObjectName("subtitle")
+        tb.addWidget(self._cnt)
+
+        root.addLayout(tb)
+
+        # Table
+        self._tbl = QTableWidget(0, 6)
+        self._tbl.setHorizontalHeaderLabels(
+            ["User ID", "First Name", "Last Name", "Organisation", "Department", "Photo"]
+        )
+        self._tbl.horizontalHeader().setStretchLastSection(False)
+        self._tbl.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Stretch
+        )
+        self._tbl.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tbl.doubleClicked.connect(self._edit)
+        root.addWidget(self._tbl)
+
+    def _load(self):
+        """Reload all rows from ac_users."""
+        rows = self.db.ac_get_all()
+        self._tbl.setRowCount(0)
+        self._tbl.setRowHeight(0, 48)
+        for r in rows:
+            row = self._tbl.rowCount()
+            self._tbl.insertRow(row)
+            self._tbl.setRowHeight(row, 48)
+            self._tbl.setItem(row, 0, QTableWidgetItem(str(r["user_id"])))
+            self._tbl.setItem(row, 1, QTableWidgetItem(r["first_name"]))
+            self._tbl.setItem(row, 2, QTableWidgetItem(r["last_name"]))
+            self._tbl.setItem(row, 3, QTableWidgetItem(r["org_name"]))
+            self._tbl.setItem(row, 4, QTableWidgetItem(r["department"]))
+
+            # Photo thumbnail cell
+            photo = r.get("photo_path", "")
+            if photo and os.path.isfile(photo):
+                pix = QPixmap(photo).scaled(
+                    36, 44,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                lbl = QLabel()
+                lbl.setPixmap(pix)
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._tbl.setCellWidget(row, 5, lbl)
+                self._tbl.setItem(row, 5, QTableWidgetItem(""))   # for selection
+            else:
+                self._tbl.setItem(row, 5, QTableWidgetItem("—"))
+
+            # Store original row dict for edit dialog pre-fill
+            self._tbl.item(row, 0).setData(Qt.ItemDataRole.UserRole, r)
+        self._cnt.setText(f"{len(rows)} person{'s' if len(rows) != 1 else ''}")
+
+    def _selected_row(self) -> int:
+        """Return the currently selected table row index, or -1."""
+        rows = list(set(i.row() for i in self._tbl.selectedItems()))
+        return rows[0] if len(rows) == 1 else -1
+
+    def _add(self):
+        dlg = AddEditUserDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.get_values()
+        try:
+            self.db.ac_upsert(
+                v["user_id"], v["first_name"], v["last_name"],
+                v["org_name"], v["department"], v["photo_path"]
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not save:\n{e}")
+            return
+        self._load()
+
+    def _edit(self):
+        row = self._selected_row()
+        if row < 0:
+            QMessageBox.information(self, "Edit", "Select a single row to edit.")
+            return
+        data = self._tbl.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        dlg  = AddEditUserDialog(self, row=data)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.get_values()
+        try:
+            self.db.ac_upsert(
+                v["user_id"], v["first_name"], v["last_name"],
+                v["org_name"], v["department"], v["photo_path"]
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not save:\n{e}")
+            return
+        self._load()
+
+    def _delete(self):
+        rows = sorted(set(i.row() for i in self._tbl.selectedItems()), reverse=True)
+        if not rows:
+            QMessageBox.information(self, "Delete", "Select rows to delete.")
+            return
+        names = []
+        for r in rows:
+            fn = self._tbl.item(r, 1).text()
+            ln = self._tbl.item(r, 2).text()
+            names.append(f"{fn} {ln}".strip() or self._tbl.item(r, 0).text())
+        if QMessageBox.question(
+            self, "Confirm Delete",
+            f"Delete {len(rows)} person(s)?\n" + "\n".join(names),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for r in rows:
+            uid = int(self._tbl.item(r, 0).text())
+            self.db.ac_delete(uid)
+        self._load()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backup & Restore Panel
+# ─────────────────────────────────────────────────────────────────────────────
+class BackupRestorePanel(QWidget):
+    """
+    Backup and restore the full InterXDB dataset:
+      - interxdb.db  (all punches + ac_users person directory)
+      - ac_photos/   (person ID photos)
+      - fingerprints/ (all .fp fingerprint template files)
+
+    Backup is saved as a single ZIP:
+      InterXDB_Backup_YYYY-MM-DD_HHMMSS.zip
+
+    Supports local drives and mapped network drives.
+    'Scan for Backups' searches all available drives + common folders
+    for existing backup ZIPs and lists them for one-click restore.
+    """
+
+    BACKUP_PREFIX = "InterXDB_Backup_"
+
+    def __init__(self, db: Database):
+        super().__init__()
+        self.db = db
+        self._build()
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(14)
+
+        hdr = QLabel("Backup && Restore")
+        hdr.setObjectName("title")
+        root.addWidget(hdr)
+
+        note = QLabel(
+            "Backup includes: database (punches + person directory), "
+            "ID photos, and fingerprint templates.\n"
+            "Backups are saved as a single ZIP file."
+        )
+        note.setObjectName("subtitle")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        # ── Backup group ──────────────────────────────────────────────
+        bg = QGroupBox("Create Backup")
+        bf = QVBoxLayout(bg)
+
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Save to:"))
+        self._dest = QLineEdit()
+        self._dest.setPlaceholderText("Select destination folder...")
+        dest_row.addWidget(self._dest)
+        dest_browse = QPushButton("Browse...")
+        dest_browse.setMaximumWidth(80)
+        dest_browse.clicked.connect(self._browse_dest)
+        dest_row.addWidget(dest_browse)
+        bf.addLayout(dest_row)
+
+        backup_btn = QPushButton("  Create Backup Now")
+        backup_btn.setObjectName("accent")
+        backup_btn.setFixedHeight(36)
+        backup_btn.clicked.connect(self._do_backup)
+        bf.addWidget(backup_btn)
+
+        self._backup_status = QLabel("")
+        self._backup_status.setObjectName("subtitle")
+        self._backup_status.setWordWrap(True)
+        bf.addWidget(self._backup_status)
+        root.addWidget(bg)
+
+        # ── Restore group ─────────────────────────────────────────────
+        rg = QGroupBox("Restore from Backup")
+        rf = QVBoxLayout(rg)
+
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel("Backup file:"))
+        self._src = QLineEdit()
+        self._src.setPlaceholderText("Select a backup ZIP file or double-click from scan below...")
+        src_row.addWidget(self._src)
+        src_browse = QPushButton("Browse...")
+        src_browse.setMaximumWidth(80)
+        src_browse.clicked.connect(self._browse_src)
+        src_row.addWidget(src_browse)
+        rf.addLayout(src_row)
+
+        restore_btn = QPushButton("  Restore Selected Backup")
+        restore_btn.setObjectName("danger")
+        restore_btn.setFixedHeight(36)
+        restore_btn.clicked.connect(self._do_restore)
+        rf.addWidget(restore_btn)
+
+        self._restore_status = QLabel("")
+        self._restore_status.setObjectName("subtitle")
+        self._restore_status.setWordWrap(True)
+        rf.addWidget(self._restore_status)
+        root.addWidget(rg)
+
+        # ── Recent backups scanner ────────────────────────────────────
+        sg = QGroupBox("Recent Backups Found on This PC")
+        sl = QVBoxLayout(sg)
+
+        scan_row = QHBoxLayout()
+        scan_btn = QPushButton("Scan for Backups")
+        scan_btn.setObjectName("accent")
+        scan_btn.clicked.connect(self._scan_backups)
+        scan_row.addWidget(scan_btn)
+        self._scan_status = QLabel("Click 'Scan' to search all drives for backup files.")
+        self._scan_status.setObjectName("subtitle")
+        scan_row.addWidget(self._scan_status)
+        scan_row.addStretch()
+        sl.addLayout(scan_row)
+
+        self._scan_tbl = QTableWidget(0, 3)
+        self._scan_tbl.setHorizontalHeaderLabels(["Backup File", "Size", "Location"])
+        self._scan_tbl.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self._scan_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self._scan_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._scan_tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._scan_tbl.setMaximumHeight(180)
+        self._scan_tbl.doubleClicked.connect(self._use_scanned)
+        sl.addWidget(QLabel("Double-click a row to load it into the Restore field above."))
+        sl.addWidget(self._scan_tbl)
+        root.addWidget(sg)
+
+        root.addStretch()
+
+    # ── Backup ────────────────────────────────────────────────────────
+
+    def _browse_dest(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Backup Destination")
+        if d:
+            self._dest.setText(d)
+
+    def _do_backup(self):
+        import zipfile
+
+        dest_dir = self._dest.text().strip()
+        if not dest_dir:
+            QMessageBox.warning(self, "No Destination",
+                                "Please select a destination folder first.")
+            return
+        if not os.path.isdir(dest_dir):
+            QMessageBox.warning(self, "Invalid Folder",
+                                f"Folder not found:\n{dest_dir}")
+            return
+
+        ts       = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        zip_name = f"{self.BACKUP_PREFIX}{ts}.zip"
+        zip_path = os.path.join(dest_dir, zip_name)
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+
+                # 1. Database
+                if os.path.isfile(self.db.path):
+                    zf.write(self.db.path, "interxdb.db")
+
+                # 2. ID photos
+                photos_dir = os.path.join(APP_DIR, "ac_photos")
+                if os.path.isdir(photos_dir):
+                    for fn in os.listdir(photos_dir):
+                        fp = os.path.join(photos_dir, fn)
+                        if os.path.isfile(fp):
+                            zf.write(fp, os.path.join("ac_photos", fn))
+
+                # 3. Fingerprint templates — APP_DIR root .fp files
+                #    and fingerprints/ subfolder if it exists
+                fp_sub = os.path.join(APP_DIR, "fingerprints")
+                for search_dir in [APP_DIR] + ([fp_sub] if os.path.isdir(fp_sub) else []):
+                    for fn in os.listdir(search_dir):
+                        if fn.endswith(".fp"):
+                            full = os.path.join(search_dir, fn)
+                            zf.write(full, os.path.join("fingerprints", fn))
+
+            size_kb = os.path.getsize(zip_path) // 1024
+            self._backup_status.setStyleSheet("color:#4caf50;")
+            self._backup_status.setText(
+                f"Backup created  ({size_kb} KB):\n{zip_path}"
+            )
+
+        except Exception as e:
+            self._backup_status.setStyleSheet("color:#f44336;")
+            self._backup_status.setText(f"Backup failed: {e}")
+
+    # ── Restore ───────────────────────────────────────────────────────
+
+    def _browse_src(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Backup ZIP", "",
+            "InterXDB Backup (*.zip);;All Files (*)"
+        )
+        if path:
+            self._src.setText(path)
+
+    def _do_restore(self):
+        import zipfile, shutil as _sh
+
+        zip_path = self._src.text().strip()
+        if not zip_path or not os.path.isfile(zip_path):
+            QMessageBox.warning(self, "No File",
+                                "Please select a valid backup ZIP file.")
+            return
+
+        if QMessageBox.question(
+            self, "Confirm Restore",
+            "Restoring will REPLACE the current database, photos, and "
+            "fingerprint files with the backup contents.\n\n"
+            "A safety copy of the current database will be saved first.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            # Safety backup of current DB before overwriting
+            ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+            bak = self.db.path + f".pre_restore_{ts}.bak"
+            if os.path.isfile(self.db.path):
+                _sh.copy2(self.db.path, bak)
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                names = zf.namelist()
+
+                # Restore database
+                if "interxdb.db" in names:
+                    with zf.open("interxdb.db") as src:
+                        with open(self.db.path, "wb") as dst:
+                            dst.write(src.read())
+
+                # Restore ID photos
+                photo_files = [n for n in names if n.startswith("ac_photos/")]
+                if photo_files:
+                    photos_dir = os.path.join(APP_DIR, "ac_photos")
+                    os.makedirs(photos_dir, exist_ok=True)
+                    for name in photo_files:
+                        fn = os.path.basename(name)
+                        if fn:
+                            with zf.open(name) as src:
+                                with open(os.path.join(photos_dir, fn), "wb") as dst:
+                                    dst.write(src.read())
+
+                # Restore fingerprint templates
+                fp_files = [n for n in names if n.startswith("fingerprints/")]
+                if fp_files:
+                    fp_dir = os.path.join(APP_DIR, "fingerprints")
+                    os.makedirs(fp_dir, exist_ok=True)
+                    for name in fp_files:
+                        fn = os.path.basename(name)
+                        if fn:
+                            with zf.open(name) as src:
+                                with open(os.path.join(fp_dir, fn), "wb") as dst:
+                                    dst.write(src.read())
+
+            # Re-run DB setup so any new schema additions are applied
+            self.db._setup()
+
+            self._restore_status.setStyleSheet("color:#4caf50;")
+            self._restore_status.setText(
+                "Restore complete. Please restart InterXDB_FFServer to reload all data.\n"
+                f"Safety backup: {os.path.basename(bak)}"
+            )
+
+        except Exception as e:
+            self._restore_status.setStyleSheet("color:#f44336;")
+            self._restore_status.setText(f"Restore failed: {e}")
+
+    # ── Scanner ───────────────────────────────────────────────────────
+
+    def _scan_backups(self):
+        """Search all available drives + common user folders for backup ZIPs."""
+        import string
+
+        self._scan_tbl.setRowCount(0)
+        self._scan_status.setText("Scanning...")
+        QApplication.processEvents()
+
+        search_dirs = []
+
+        # Every drive letter — covers local SSDs, USB drives, mapped network drives
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.isdir(drive):
+                search_dirs.append(drive)
+                # One level deep on each drive
+                try:
+                    for sub in os.listdir(drive):
+                        full = os.path.join(drive, sub)
+                        if os.path.isdir(full):
+                            search_dirs.append(full)
+                except (PermissionError, OSError):
+                    pass
+
+        # Common user folders
+        home = os.path.expanduser("~")
+        for folder in ("Desktop", "Documents", "Downloads", "Backup", "Backups"):
+            p = os.path.join(home, folder)
+            if os.path.isdir(p):
+                search_dirs.append(p)
+
+        # APP_DIR itself
+        search_dirs.append(APP_DIR)
+
+        found = []
+        seen  = set()
+        for d in search_dirs:
+            try:
+                for fn in os.listdir(d):
+                    if fn.startswith(self.BACKUP_PREFIX) and fn.endswith(".zip"):
+                        full = os.path.join(d, fn)
+                        if full not in seen and os.path.isfile(full):
+                            seen.add(full)
+                            found.append(full)
+            except (PermissionError, OSError):
+                pass
+
+        # Sort newest first (timestamp is in the filename)
+        found.sort(reverse=True)
+
+        for path in found:
+            row = self._scan_tbl.rowCount()
+            self._scan_tbl.insertRow(row)
+            fn      = os.path.basename(path)
+            size_kb = os.path.getsize(path) // 1024
+            self._scan_tbl.setItem(row, 0, QTableWidgetItem(fn))
+            self._scan_tbl.setItem(row, 1, QTableWidgetItem(f"{size_kb} KB"))
+            self._scan_tbl.setItem(row, 2, QTableWidgetItem(os.path.dirname(path)))
+            # Store full path for double-click
+            self._scan_tbl.item(row, 0).setData(Qt.ItemDataRole.UserRole, path)
+
+        count = len(found)
+        self._scan_status.setText(
+            f"{count} backup{'s' if count != 1 else ''} found."
+        )
+
+    def _use_scanned(self):
+        """Double-click: load selected scan result into the Restore field."""
+        row = self._scan_tbl.currentRow()
+        if row < 0:
+            return
+        path = self._scan_tbl.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        if path:
+            self._src.setText(path)
+            self._restore_status.setStyleSheet("color:#4a9eff;")
+            self._restore_status.setText(
+                "Backup loaded — click 'Restore Selected Backup' to proceed."
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Window
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -1403,6 +2118,8 @@ class MainWindow(QMainWindow):
             ("users",        "  Users"),
             ("fingerprints", "  Fingerprints"),
             ("network",      "  Network"),
+            ("manage_users", "  Manage Users"),
+            ("backup",       "  Backup & Restore"),
             ("settings",     "  Settings"),
         ]
         for key, label in nav_items:
@@ -1417,6 +2134,17 @@ class MainWindow(QMainWindow):
         self._dev_info.setWordWrap(True)
         sl.addWidget(self._dev_info)
 
+        # Exit button at the bottom of the sidebar
+        exit_btn = QPushButton("  Exit")
+        exit_btn.setObjectName("nav")
+        exit_btn.setStyleSheet(
+            "QPushButton { color:#f44336; text-align:left; padding:13px 20px; "
+            "border:none; border-top:1px solid #2a2a4a; background:transparent; }"
+            "QPushButton:hover { background:#2a1a1a; color:#ff6b6b; }"
+        )
+        exit_btn.clicked.connect(self.close)
+        sl.addWidget(exit_btn)
+
         row.addWidget(sidebar)
 
         # ── Content stack ──────────────────────────────────────────────
@@ -1426,9 +2154,11 @@ class MainWindow(QMainWindow):
         self._p_usr  = UsersPanel()
         self._p_fp   = FingerprintsPanel()
         self._p_net  = NetworkPanel()
+        self._p_mgt  = ManageUsersPanel(self.db)    # person directory (ac_users)
+        self._p_bak  = BackupRestorePanel(self.db)  # backup & restore
         self._p_set  = SettingsPanel()
 
-        for w in (self._p_dash, self._p_log, self._p_usr, self._p_fp, self._p_net, self._p_set):
+        for w in (self._p_dash, self._p_log, self._p_usr, self._p_fp, self._p_net, self._p_mgt, self._p_bak, self._p_set):
             wrap = QWidget(); wl = QVBoxLayout(wrap)
             wl.setContentsMargins(20, 16, 20, 16); wl.addWidget(w)
             self._stack.addWidget(wrap)
@@ -1456,7 +2186,7 @@ class MainWindow(QMainWindow):
         self._nav_to("dashboard")
 
     def _nav_to(self, key):
-        order = ["dashboard", "punchlog", "users", "fingerprints", "network", "settings"]
+        order = ["dashboard", "punchlog", "users", "fingerprints", "network", "manage_users", "backup", "settings"]
         self._stack.setCurrentIndex(order.index(key) if key in order else 0)
         for k, btn in self._nav.items():
             btn.setProperty("active", k == key)
